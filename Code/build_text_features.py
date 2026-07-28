@@ -12,64 +12,11 @@ from bs4 import BeautifulSoup
 
 TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z\-']+")
 
-NEGATIVE_WORDS = {
-    "adverse",
-    "decline",
-    "decrease",
-    "default",
-    "deteriorate",
-    "difficult",
-    "failure",
-    "loss",
-    "losses",
-    "negative",
-    "risk",
-    "risks",
-    "uncertain",
-    "weakness",
-}
-
-POSITIVE_WORDS = {
-    "benefit",
-    "efficient",
-    "favorable",
-    "gain",
-    "gains",
-    "growth",
-    "improve",
-    "improved",
-    "opportunity",
-    "positive",
-    "profit",
-    "strong",
-}
-
-UNCERTAINTY_WORDS = {
-    "approximately",
-    "contingent",
-    "depend",
-    "depends",
-    "fluctuate",
-    "may",
-    "might",
-    "possible",
-    "uncertain",
-    "uncertainty",
-    "variable",
-    "whether",
-}
-
-LITIGIOUS_WORDS = {
-    "claim",
-    "claims",
-    "complaint",
-    "court",
-    "legal",
-    "litigation",
-    "plaintiff",
-    "regulatory",
-    "settlement",
-    "sue",
+DICTIONARY_FILES = {
+    "negative": "negative_words.csv",
+    "positive": "positive_words.csv",
+    "uncertainty": "uncertainty_words.csv",
+    "litigious": "litigious_words.csv",
 }
 
 
@@ -93,7 +40,24 @@ def parse_args() -> argparse.Namespace:
         default=1000,
         help="Mark filings with fewer words than this as suspicious.",
     )
+    parser.add_argument(
+        "--dictionary-dir",
+        default="config/dictionaries",
+        help="Folder containing the CSV word lists used for dictionary features.",
+    )
     return parser.parse_args()
+
+
+def load_word_list(path: Path) -> set[str]:
+    words = pd.read_csv(path)["word"].dropna().astype(str).str.lower().str.strip()
+    return set(words.loc[words != ""])
+
+
+def load_dictionaries(dictionary_dir: Path) -> dict[str, set[str]]:
+    return {
+        name: load_word_list(dictionary_dir / filename)
+        for name, filename in DICTIONARY_FILES.items()
+    }
 
 
 def html_to_text(html: str) -> str:
@@ -127,7 +91,7 @@ def count_sentences(text: str) -> int:
     return max(sentence_marks, 1)
 
 
-def text_features(text: str) -> dict[str, float]:
+def text_features(text: str, dictionaries: dict[str, set[str]]) -> dict[str, float]:
     tokens = tokenize(text)
     counter = Counter(tokens)
     total = len(tokens)
@@ -142,10 +106,10 @@ def text_features(text: str) -> dict[str, float]:
         "avg_word_length": avg_word_length,
         "avg_sentence_length": total / sentence_count if total else 0.0,
         "log_word_count": math.log1p(total),
-        "negative_share": word_share(counter, NEGATIVE_WORDS, total),
-        "positive_share": word_share(counter, POSITIVE_WORDS, total),
-        "uncertainty_share": word_share(counter, UNCERTAINTY_WORDS, total),
-        "litigious_share": word_share(counter, LITIGIOUS_WORDS, total),
+        "negative_share": word_share(counter, dictionaries["negative"], total),
+        "positive_share": word_share(counter, dictionaries["positive"], total),
+        "uncertainty_share": word_share(counter, dictionaries["uncertainty"], total),
+        "litigious_share": word_share(counter, dictionaries["litigious"], total),
     }
 
 
@@ -172,7 +136,12 @@ def resolve_local_path(local_path: str, project_root: Path) -> Path:
     return project_root / path
 
 
-def build_feature_row(filing: dict, project_root: Path, min_words: int) -> dict:
+def build_feature_row(
+    filing: dict,
+    project_root: Path,
+    min_words: int,
+    dictionaries: dict[str, set[str]],
+) -> dict:
     row = {
         "ticker": filing.get("ticker"),
         "cik": filing.get("cik"),
@@ -192,7 +161,7 @@ def build_feature_row(filing: dict, project_root: Path, min_words: int) -> dict:
         return row
 
     text = read_filing_text(path)
-    features = text_features(text)
+    features = text_features(text, dictionaries)
     row.update(features)
 
     if features["word_count"] < min_words:
@@ -205,6 +174,7 @@ def build_feature_row(filing: dict, project_root: Path, min_words: int) -> dict:
 def main() -> None:
     args = parse_args()
     project_root = Path.cwd()
+    dictionaries = load_dictionaries(project_root / args.dictionary_dir)
     filings = pd.read_csv(args.filings)
 
     if "download_status" in filings.columns:
@@ -220,7 +190,7 @@ def main() -> None:
         filing_date = filing.get("filing_date")
         print(f"[{index}/{len(filings)}] Extracting text features for {ticker} {filing_date}")
         try:
-            rows.append(build_feature_row(filing, project_root, args.min_words))
+            rows.append(build_feature_row(filing, project_root, args.min_words, dictionaries))
         except Exception as error:
             rows.append(
                 {
